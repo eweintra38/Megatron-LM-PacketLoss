@@ -20,8 +20,9 @@ Per iteration:
 | (3) Owner j updates its shard | unchanged distributed optimizer step |
 | (4) Shard j → rank i is lost with probability p; rank i keeps its old copy | after the all-gather, a receiver restores each "dropped" shard to the last copy it received, so staleness accumulates over consecutive losses |
 
-Drop decisions are independent across links, iterations and ranks: every rank draws from its
-own random stream, derived from `DROP_SEED` and its global rank.
+Every rank draws from its own random stream, derived from `DROP_SEED` and its global rank.
+With the i.i.d. model, drop decisions are independent across links, iterations and ranks; with
+the Gilbert-Elliott model, losses come in bursts (see below).
 
 ## Settings
 
@@ -54,11 +55,16 @@ examples/llama/pretrain_llama.sh
   decision per iteration and collective.
 - The unit of loss is a whole shard slice (tens of MB for a billion-parameter model), not a
   network packet: `p` is a per-shard loss rate.
-- Gilbert-Elliott: each rank keeps one chain per collective, and the chain advances once per
-  link decision (N−1 times per iteration), not once per iteration. With the defaults, a Bad
-  period lasts about 10 link decisions, i.e. a fraction of one iteration.
-- The drop streams are not saved in checkpoints. After a resume they restart from
-  `EW_DROP_SEED`; change the seed when resuming if fresh draws are wanted.
+- Gilbert-Elliott: each rank keeps one Good/Bad chain per collective, advanced once per
+  iteration. Given the state, each of the rank's links is dropped independently, so a Bad
+  period hits all of the rank's links at once (like a congested NIC). For gradients the chain
+  belongs to the sender (its outgoing slices), for parameters to the receiver (its incoming
+  shards). With the defaults, Good periods last about 100 iterations and Bad periods about 10
+  iterations at 70% loss; the mean loss is about 7.3%. (There is one chain per bucket group; a
+  dense model with overlap disabled has a single group.)
+- The drop streams and Gilbert-Elliott states are not saved in checkpoints. After a resume
+  they restart from `EW_DROP_SEED` (and the Good state); change the seed when resuming if
+  fresh draws are wanted.
 
 ## Cloning on Windows
 

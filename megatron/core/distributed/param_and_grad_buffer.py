@@ -53,6 +53,10 @@ def _drop_rng() -> random.Random:
 
 
 # ─── 1. Define Gilbert-Elliott ───────────────────────────────────────────────────
+# One chain per rank and collective. step() advances the Good/Bad state once per
+# iteration; should_drop() then samples each of the rank's links independently
+# given that shared state, so a Bad period hits all of the rank's links for ~1/r
+# iterations (e.g. a congested NIC or a PFC pause).
 class GilbertElliott:
     def __init__(self, p: float, r: float, pg: float, pb: float):
         self.p = p      # G→B transition prob
@@ -61,7 +65,7 @@ class GilbertElliott:
         self.pb = pb    # drop-prob in Bad state
         self.state = 'G'
 
-    def should_drop(self) -> bool:
+    def step(self) -> None:
         rng = _drop_rng()
         # state transition
         if self.state == 'G':
@@ -70,8 +74,10 @@ class GilbertElliott:
         else:
             if rng.random() < self.r:
                 self.state = 'G'
-        # now sample drop in current state
-        return rng.random() < (self.pg if self.state == 'G' else self.pb)
+
+    def should_drop(self) -> bool:
+        # sample drop in current state
+        return _drop_rng().random() < (self.pg if self.state == 'G' else self.pb)
 
 class BufferType(Enum):
     """
@@ -298,6 +304,8 @@ class _ParamAndGradBucketGroup:
         local_rank = self.intra_distributed_optimizer_instance_rank
         global_rank = torch.distributed.get_rank()
         rng = _drop_rng()
+        if USE_GE:
+            self._param_loss_model.step()  # once per iteration (receiver's chain)
         for bucket in self.buckets:
             shard_size = bucket.param_data.numel() // world_size
             assert bucket.param_data.numel() % world_size == 0, "Param buffer must align with world size."
@@ -444,6 +452,8 @@ class _ParamAndGradBucketGroup:
             world_size = torch.distributed.get_world_size(group)
             local_rank = self.intra_distributed_optimizer_instance_rank
             rng = _drop_rng()
+            if USE_GE:
+                self._grad_loss_model.step()  # once per iteration (sender's chain)
             for bucket in self.buckets:
                 shard_size = bucket.grad_data.numel() // world_size
                 bucket._packet_loss_grad_mask = torch.ones(
