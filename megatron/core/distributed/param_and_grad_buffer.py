@@ -7,6 +7,11 @@ from enum import Enum
 from typing import Dict, List, Optional
 
 import torch
+
+import os
+import random
+import torch.distributed as dist
+
 from torch.distributed import _coalescing_manager
 
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -24,6 +29,30 @@ else:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
+# ─── MODE SWITCH ───────────────────────────────────────────────────────────────
+# choose between "uniform" (IID) or "ge" (Gilbert-Elliott bursty)
+DROP_MODEL = os.getenv("DROP_MODEL", "uniform").lower()
+USE_GE = DROP_MODEL == "ge"
+
+# ─── 1. Define Gilbert-Elliott ───────────────────────────────────────────────────
+class GilbertElliott:
+    def __init__(self, p: float, r: float, pg: float, pb: float):
+        self.p = p      # G→B transition prob
+        self.r = r      # B→G transition prob
+        self.pg = pg    # drop-prob in Good state
+        self.pb = pb    # drop-prob in Bad state
+        self.state = 'G'
+
+    def should_drop(self) -> bool:
+        # state transition
+        if self.state == 'G':
+            if random.random() < self.p:
+                self.state = 'B'
+        else:
+            if random.random() < self.r:
+                self.state = 'G'
+        # now sample drop in current state
+        return random.random() < (self.pg if self.state == 'G' else self.pb)
 
 class BufferType(Enum):
     """
@@ -120,6 +149,18 @@ class _ParamAndGradBucketGroup:
         else:
             self.data_parallel_group = collective_group
 
+        # ─── 2. Optionally instantiate GE models ─────────────────────────
+        if USE_GE:
+            p  = float(os.getenv("GE_P",  "0.01"))  # G→B
+            r  = float(os.getenv("GE_R",  "0.10"))  # B→G
+            pg = float(os.getenv("GE_PG", "0.01"))  # drop in Good
+            pb = float(os.getenv("GE_PB", "0.70"))  # drop in Bad
+            self._param_loss_model = GilbertElliott(p, r, pg, pb)
+            self._grad_loss_model  = GilbertElliott(p, r, pg, pb)
+        else:
+            self._param_loss_model = None
+            self._grad_loss_model  = None
+
         # State for bookkeeping: params is the set of parameters this bucket group is
         # responsible for, params_with_grad is the set of parameters with grads
         # available. When overlap_grad_reduce is True, communication (all-reduce
@@ -212,6 +253,7 @@ class _ParamAndGradBucketGroup:
                     group=self.intra_distributed_optimizer_instance_group,
                     async_op=async_op,
                 )
+
         if async_op:
             self.param_gather_handle = cm
         else:
@@ -222,6 +264,40 @@ class _ParamAndGradBucketGroup:
             # None.
             self.param_gather_handle = None
         self.param_gather_dispatched = True
+
+        drop_prob = float(os.getenv("PACKET_LOSS_PROB_PARAM", "0.0"))
+        #drop_prob = 0.3
+        group = self.intra_distributed_optimizer_instance_group
+        world_size = torch.distributed.get_world_size(group)
+        local_rank = self.intra_distributed_optimizer_instance_rank
+        global_rank = torch.distributed.get_rank()
+        for bucket in self.buckets:
+            shard_size = bucket.param_data.numel() // world_size
+            assert bucket.param_data.numel() % world_size == 0, "Param buffer must align with world size."
+            if not hasattr(bucket, '_packet_loss_prev_param_data'):
+                bucket._packet_loss_prev_param_data = bucket.param_data.clone().detach()
+            for rank in range(world_size):
+                start, end = rank * shard_size, (rank + 1) * shard_size
+                # if rank == local_rank or random.random() >= drop_prob:
+                # decide KEEP vs DROP depending on mode
+                if rank == local_rank:
+                    keep = True
+                elif USE_GE:
+                    # bursty GE model
+                    keep = not self._param_loss_model.should_drop()
+                else:
+                    # uniform IID
+                    keep = (random.random() >= drop_prob)
+
+                if keep:
+                    # Update backup with freshly synchronized data if NOT dropped or local shard
+                    bucket._packet_loss_prev_param_data[start:end].copy_(bucket.param_data[start:end])
+                else:
+                    # Otherwise restore previous shard (simulating a drop)
+                    # print(f"[ParamDropSim][Rank {global_rank}] BEFORE DROP bucket {bucket.bucket_id} from rank {rank}: {bucket.param_data[start:end]}")
+                    bucket.param_data[start:end].copy_(bucket._packet_loss_prev_param_data[start:end])
+                    # print(f"[ParamDropSim][Rank {global_rank}] Dropped param shard from rank {rank} in bucket {bucket.bucket_id}")
+                    # print(f"[ParamDropSim][Rank {global_rank}] AFTER DROP bucket {bucket.bucket_id} from rank {rank}: {bucket.param_data[start:end]}")
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """
@@ -313,6 +389,36 @@ class _ParamAndGradBucketGroup:
         else:
             communication_group = self.data_parallel_group
 
+        # Pre reduce-scatter: per-(sender, receiver) Bernoulli / GE drop mask.
+        # This rank decides, for each receiver r, whether to deliver its shard
+        # intended for r. Dropped slices are zeroed in-place BEFORE the
+        # collective so they contribute 0 to the receiver's sum. The mask
+        # vector is later all-reduced (SUM) to obtain the survivor count S_j
+        # at every receiver. Self-loop (r == local_rank) always kept (matches
+        # the existing simulator convention; equivalent to s^{(j,j)} == 1).
+        # Skipped entirely when drops are disabled — keeps RNG state and
+        # collective ordering bit-identical to the un-patched run.
+        drop_prob = float(os.getenv("PACKET_LOSS_PROB_GRAD", "0.0"))
+        if self.ddp_config.use_distributed_optimizer and (drop_prob > 0.0 or USE_GE):
+            group = self.intra_distributed_optimizer_instance_group
+            world_size = torch.distributed.get_world_size(group)
+            local_rank = self.intra_distributed_optimizer_instance_rank
+            for bucket in self.buckets:
+                shard_size = bucket.grad_data.numel() // world_size
+                bucket._packet_loss_grad_mask = torch.ones(
+                    world_size, dtype=torch.float32, device=bucket.grad_data.device
+                )
+                for r in range(world_size):
+                    if r == local_rank:
+                        continue
+                    if USE_GE:
+                        keep = not self._grad_loss_model.should_drop()
+                    else:
+                        keep = (random.random() >= drop_prob)
+                    if not keep:
+                        bucket.grad_data[r * shard_size : (r + 1) * shard_size].zero_()
+                        bucket._packet_loss_grad_mask[r] = 0.0
+
         # Coalesce communication kernels across buckets in the bucket group.
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for bucket in self.buckets:
@@ -367,6 +473,39 @@ class _ParamAndGradBucketGroup:
             # None.
             self.grad_reduce_handle = None
 
+        # Post reduce-scatter: renormalize the local shard from /N (NCCL's
+        # average over all senders, or SUM scaled by 1/N via gradient_scaling_factor)
+        # to /S_j, where S_j = sum over senders of the survival indicator
+        # toward THIS receiver. Falls back to the previous iteration's shard
+        # only when S_j == 0 (regularizer in §4.2-(2) of the model).
+        if self.ddp_config.use_distributed_optimizer and (drop_prob > 0.0 or USE_GE):
+            group = self.intra_distributed_optimizer_instance_group
+            world_size = torch.distributed.get_world_size(group)
+            local_rank = self.intra_distributed_optimizer_instance_rank
+
+            for bucket in self.buckets:
+                shard_size = bucket.grad_data.numel() // world_size
+                assert bucket.grad_data.numel() % world_size == 0, "Gradient buffer size must align with world size."
+
+                if not hasattr(bucket, '_packet_loss_prev_grad_data'):
+                    bucket._packet_loss_prev_grad_data = bucket.grad_data.clone().detach()
+
+                # Receiver-side survivor counts S_j for every receiver j.
+                torch.distributed.all_reduce(
+                    bucket._packet_loss_grad_mask,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+                s_local = int(bucket._packet_loss_grad_mask[local_rank].item())
+
+                start, end = local_rank * shard_size, (local_rank + 1) * shard_size
+                if s_local == 0:
+                    bucket.grad_data[start:end].copy_(bucket._packet_loss_prev_grad_data[start:end])
+                else:
+                    # Convert /N average to /S_j average (matches \hat g in Algorithm 1, line 8).
+                    bucket.grad_data[start:end].mul_(world_size / s_local)
+                    bucket._packet_loss_prev_grad_data[start:end].copy_(bucket.grad_data[start:end])
+
     def finish_grad_sync(self):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
@@ -392,7 +531,7 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
-
+ 
     def register_grad_ready(self, param: torch.nn.Parameter):
         """
         Registers grads for the passed-in param to be "ready" for grad sync.
