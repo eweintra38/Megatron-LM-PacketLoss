@@ -34,6 +34,24 @@ else:
 DROP_MODEL = os.getenv("DROP_MODEL", "uniform").lower()
 USE_GE = DROP_MODEL == "ge"
 
+# ─── 0. Per-rank RNG for drop decisions ─────────────────────────────────────────
+# The global `random` module is seeded identically on every data-parallel rank
+# (Megatron's --seed), so drawing from it makes all ranks consume the same sequence
+# and their drop decisions perfectly correlated. Each rank therefore gets its own
+# stream, derived from DROP_SEED (vary it between repeated runs) and its global rank.
+# Note: this stream is not stored in checkpoints; after a resume it restarts from
+# the seed unless DROP_SEED is changed.
+_DROP_RNG = None
+
+
+def _drop_rng() -> random.Random:
+    global _DROP_RNG
+    if _DROP_RNG is None:
+        seed = int(os.getenv("DROP_SEED", "0"))
+        _DROP_RNG = random.Random(f"packet-loss/{seed}/{torch.distributed.get_rank()}")
+    return _DROP_RNG
+
+
 # ─── 1. Define Gilbert-Elliott ───────────────────────────────────────────────────
 class GilbertElliott:
     def __init__(self, p: float, r: float, pg: float, pb: float):
@@ -44,15 +62,16 @@ class GilbertElliott:
         self.state = 'G'
 
     def should_drop(self) -> bool:
+        rng = _drop_rng()
         # state transition
         if self.state == 'G':
-            if random.random() < self.p:
+            if rng.random() < self.p:
                 self.state = 'B'
         else:
-            if random.random() < self.r:
+            if rng.random() < self.r:
                 self.state = 'G'
         # now sample drop in current state
-        return random.random() < (self.pg if self.state == 'G' else self.pb)
+        return rng.random() < (self.pg if self.state == 'G' else self.pb)
 
 class BufferType(Enum):
     """
@@ -267,10 +286,18 @@ class _ParamAndGradBucketGroup:
 
         drop_prob = float(os.getenv("PACKET_LOSS_PROB_PARAM", "0.0"))
         #drop_prob = 0.3
+        if drop_prob == 0.0 and not USE_GE:
+            return
+        # The restore below must run after the all-gather has completed.
+        assert not async_op, (
+            "Packet-loss simulation needs a synchronous param all-gather: "
+            "disable --overlap-param-gather."
+        )
         group = self.intra_distributed_optimizer_instance_group
         world_size = torch.distributed.get_world_size(group)
         local_rank = self.intra_distributed_optimizer_instance_rank
         global_rank = torch.distributed.get_rank()
+        rng = _drop_rng()
         for bucket in self.buckets:
             shard_size = bucket.param_data.numel() // world_size
             assert bucket.param_data.numel() % world_size == 0, "Param buffer must align with world size."
@@ -287,7 +314,7 @@ class _ParamAndGradBucketGroup:
                     keep = not self._param_loss_model.should_drop()
                 else:
                     # uniform IID
-                    keep = (random.random() >= drop_prob)
+                    keep = (rng.random() >= drop_prob)
 
                 if keep:
                     # Update backup with freshly synchronized data if NOT dropped or local shard
@@ -399,10 +426,24 @@ class _ParamAndGradBucketGroup:
         # Skipped entirely when drops are disabled — keeps RNG state and
         # collective ordering bit-identical to the un-patched run.
         drop_prob = float(os.getenv("PACKET_LOSS_PROB_GRAD", "0.0"))
-        if self.ddp_config.use_distributed_optimizer and (drop_prob > 0.0 or USE_GE):
+        drop_grads = drop_prob > 0.0 or USE_GE
+        if drop_grads:
+            # Fail loudly instead of silently simulating nothing.
+            assert self.ddp_config.use_distributed_optimizer, (
+                "Gradient-drop simulation hooks the reduce-scatter: "
+                "enable --use-distributed-optimizer."
+            )
+            assert not async_op, (
+                "Gradient-drop simulation needs a synchronous reduce-scatter: "
+                "disable --overlap-grad-reduce."
+            )
+            assert self.ddp_config.num_distributed_optimizer_instances == 1, (
+                "Gradient-drop simulation supports a single distributed-optimizer instance."
+            )
             group = self.intra_distributed_optimizer_instance_group
             world_size = torch.distributed.get_world_size(group)
             local_rank = self.intra_distributed_optimizer_instance_rank
+            rng = _drop_rng()
             for bucket in self.buckets:
                 shard_size = bucket.grad_data.numel() // world_size
                 bucket._packet_loss_grad_mask = torch.ones(
@@ -414,7 +455,7 @@ class _ParamAndGradBucketGroup:
                     if USE_GE:
                         keep = not self._grad_loss_model.should_drop()
                     else:
-                        keep = (random.random() >= drop_prob)
+                        keep = (rng.random() >= drop_prob)
                     if not keep:
                         bucket.grad_data[r * shard_size : (r + 1) * shard_size].zero_()
                         bucket._packet_loss_grad_mask[r] = 0.0
@@ -476,9 +517,10 @@ class _ParamAndGradBucketGroup:
         # Post reduce-scatter: renormalize the local shard from /N (NCCL's
         # average over all senders, or SUM scaled by 1/N via gradient_scaling_factor)
         # to /S_j, where S_j = sum over senders of the survival indicator
-        # toward THIS receiver. Falls back to the previous iteration's shard
-        # only when S_j == 0 (regularizer in §4.2-(2) of the model).
-        if self.ddp_config.use_distributed_optimizer and (drop_prob > 0.0 or USE_GE):
+        # toward THIS receiver. S_j >= 1 because a rank never drops its own
+        # slice; the fallback to the previous iteration's shard for S_j == 0
+        # (the regularizer in Sec. 3.2) is only a safeguard.
+        if drop_grads:
             group = self.intra_distributed_optimizer_instance_group
             world_size = torch.distributed.get_world_size(group)
             local_rank = self.intra_distributed_optimizer_instance_rank
@@ -502,7 +544,7 @@ class _ParamAndGradBucketGroup:
                 if s_local == 0:
                     bucket.grad_data[start:end].copy_(bucket._packet_loss_prev_grad_data[start:end])
                 else:
-                    # Convert /N average to /S_j average (matches \hat g in Algorithm 1, line 8).
+                    # Convert /N average to /S_j average (\hat g in Sec. 3, step (2)).
                     bucket.grad_data[start:end].mul_(world_size / s_local)
                     bucket._packet_loss_prev_grad_data[start:end].copy_(bucket.grad_data[start:end])
 

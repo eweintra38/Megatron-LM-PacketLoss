@@ -8,7 +8,13 @@ set -ex
 DROP_MODEL=${HL_DROP_MODEL:-uniform} # uniform or ge
 PACKET_LOSS_PROB_PARAM=${EW_PACKET_LOSS_PROB_PARAM:-0.0}
 PACKET_LOSS_PROB_GRAD=${EW_PACKET_LOSS_PROB_GRAD:-0.0}
-export PACKET_LOSS_PROB_PARAM PACKET_LOSS_PROB_GRAD HL_DROP_MODEL
+DROP_SEED=${EW_DROP_SEED:-0} # use a different value for each repeated run
+# Gilbert-Elliott parameters (used when DROP_MODEL=ge)
+GE_P=${EW_GE_P:-0.01}   # G->B transition prob
+GE_R=${EW_GE_R:-0.10}   # B->G transition prob
+GE_PG=${EW_GE_PG:-0.01} # drop prob in Good state
+GE_PB=${EW_GE_PB:-0.70} # drop prob in Bad state
+export PACKET_LOSS_PROB_PARAM PACKET_LOSS_PROB_GRAD DROP_MODEL DROP_SEED GE_P GE_R GE_PG GE_PB
 # Distributed training variables
 LAUNCHER_TYPE=${HL_LAUNCHER_TYPE:-mpirun}
 DATA_DIR=${HL_DATA_DIR_ROOT:-/data/datasets/red_pajama}
@@ -330,6 +336,8 @@ if [[ "${LAUNCHER_TYPE}" = "mpirun" ]]; then
     CMD="${CMD} -x DROP_MODEL=${DROP_MODEL}"
     CMD="${CMD} -x PACKET_LOSS_PROB_PARAM=${PACKET_LOSS_PROB_PARAM}"
     CMD="${CMD} -x PACKET_LOSS_PROB_GRAD=${PACKET_LOSS_PROB_GRAD}"
+    CMD="${CMD} -x DROP_SEED=${DROP_SEED}"
+    CMD="${CMD} -x GE_P=${GE_P} -x GE_R=${GE_R} -x GE_PG=${GE_PG} -x GE_PB=${GE_PB}"
     CMD="${CMD} -x PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${PT_TE_ENFORCE_BF16_AMAX_REDUCTION}"
     CMD="${CMD} -x PT_TE_LIMIT_GRAPH_SIZE=${PT_TE_LIMIT_GRAPH_SIZE}"
     CMD="${CMD} -x PT_HPU_LAZY_MODE=${USE_LAZY_MODE}"
