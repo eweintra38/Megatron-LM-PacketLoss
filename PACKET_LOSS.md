@@ -78,6 +78,25 @@ or more log files (repeats) into early- and late-window averages, normalized by 
 python tools/packet_loss_summary.py run1/drop_metrics.jsonl run2/drop_metrics.jsonl run3/drop_metrics.jsonl
 ```
 
+## Checking the analysis
+
+`tools/packet_loss_validation/` holds the NumPy scripts behind Appendix A of the thesis. They
+need only Python 3.8+ and NumPy, not Megatron or accelerators, and use fixed seeds.
+
+- `appendix_checks.py` checks the results of Section 3: exact enumeration and Monte Carlo of
+  the drift theorem (uncorrelated, constant, mixed and momentum updates), the aggregation
+  weights and variance factor, the full protocol with SGD on least squares (drift and the
+  staleness bias bound), Gilbert-Elliott and position-dependent losses with and without
+  interleaving, and shard-level versus packet-level loss. Run all checks with
+  `python tools/packet_loss_validation/appendix_checks.py`, or a subset, e.g. `... A1 A3`.
+- `drop_log_mirror.py` re-implements the logging above on N simulated ranks and writes log
+  files in the same format, to check the estimators (including the pair-drift identity):
+
+```bash
+python tools/packet_loss_validation/drop_log_mirror.py /tmp/mirror 0.4 4000 100 3
+python tools/packet_loss_summary.py /tmp/mirror_r1.jsonl /tmp/mirror_r2.jsonl /tmp/mirror_r3.jsonl
+```
+
 ## Requirements and limitations
 
 - Needs `--use-distributed-optimizer` (the script's default) and synchronous collectives: do not
