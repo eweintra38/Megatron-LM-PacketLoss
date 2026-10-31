@@ -36,14 +36,46 @@ Set these before calling `examples/llama/pretrain_llama.sh`; the script forwards
 | `EW_DROP_SEED` | `0` | seed of the drop streams; use a different value for each repeated run |
 | `EW_GE_P`, `EW_GE_R` | `0.01`, `0.10` | Gilbert-Elliott transition probabilities G→B and B→G |
 | `EW_GE_PG`, `EW_GE_PB` | `0.01`, `0.70` | drop probability in the Good and Bad state |
+| `EW_DROP_LOG_INTERVAL` | `0` | log the measurements below every N iterations (`0` = off) |
+| `EW_DROP_LOG_FILE` | `<output dir>/drop_metrics.jsonl` | where global rank 0 appends the measurements |
+| `HL_SEED` | `1234` | Megatron's `--seed` (model initialization and data order) |
+| `HL_LR`, `HL_MIN_LR` | model preset | peak and minimum learning rate |
+| `HL_LR_WARMUP_ITERS` | model preset | learning-rate warmup iterations |
 
-Example (8 nodes × 8 Gaudi 3, 40% loss on both collectives, repeat #1):
+Example (one node of 8 Gaudi 3, a 134M-parameter model, 40% loss on both collectives,
+repeat #1, measurements every 100 iterations):
 
 ```bash
-HL_NUM_NODES=8 HL_DP=64 HL_TP=1 HL_PP=1 HL_HOSTSFILE=/path/to/hostsfile \
+HL_NUM_NODES=1 HL_DP=8 HL_TP=1 HL_PP=1 \
 HL_DATA_DIR_ROOT=/path/to/red_pajama HL_TOKENIZER_MODEL=/path/to/tokenizer.model \
-EW_PACKET_LOSS_PROB_GRAD=0.4 EW_PACKET_LOSS_PROB_PARAM=0.4 EW_DROP_SEED=1 \
+HL_LLAMA_VER=2 HL_LLAMA_MODEL_SIZE=7 HL_NUM_LAYERS=12 HL_HIDDEN_SIZE=768 HL_NUM_HEADS=12 \
+HL_NUM_QUERY_GROUPS=12 HL_FFN_HIDDEN_SIZE=2048 HL_SEQ_LEN=1024 HL_GBS=256 HL_MICRO_BATCH=8 \
+HL_TRAIN_ITERS=10000 HL_LR=6e-4 HL_MIN_LR=6e-5 HL_LR_WARMUP_ITERS=200 HL_SEED=1235 \
+EW_PACKET_LOSS_PROB_GRAD=0.4 EW_PACKET_LOSS_PROB_PARAM=0.4 EW_DROP_SEED=1 EW_DROP_LOG_INTERVAL=100 \
 examples/llama/pretrain_llama.sh
+```
+
+## Measurements
+
+With `EW_DROP_LOG_INTERVAL > 0`, each line of the log file summarizes one interval. All values
+are per shard (one rank's slice of the parameter buffer) and averaged over ranks:
+
+| Field | Meaning |
+|---|---|
+| `mean_age` | staleness age (iterations since the last received broadcast) of the non-owned copies |
+| `stale_err` | `‖copy − owner's shard‖²` of the non-owned copies after the broadcast (0 if received) |
+| `update_sq` | `‖Δθ‖²` of each rank's own shard per iteration, an estimate of `σ_j²` |
+| `pair_drift` | mean `‖copy_i − copy_k‖²` over pairs of non-owners, measured at the end of the interval |
+| `mean_S`, `mean_inv_S` | number of gradient pieces that arrived for each rank's own shard, and its inverse |
+| `param_loss_rate`, `grad_loss_rate` | realized fractions of lost broadcasts and gradient pieces |
+
+Staleness errors and update sizes are measured right after the all-gather, before a lost shard
+is restored. The pair drift uses one all-reduce of the staleness errors per interval. Logging
+also works with drops disabled (a lossless baseline). `tools/packet_loss_summary.py` turns one
+or more log files (repeats) into early- and late-window averages, normalized by `update_sq`:
+
+```bash
+python tools/packet_loss_summary.py run1/drop_metrics.jsonl run2/drop_metrics.jsonl run3/drop_metrics.jsonl
 ```
 
 ## Requirements and limitations

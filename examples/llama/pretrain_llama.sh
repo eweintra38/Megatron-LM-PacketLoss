@@ -14,7 +14,8 @@ GE_P=${EW_GE_P:-0.01}   # G->B transition prob
 GE_R=${EW_GE_R:-0.10}   # B->G transition prob
 GE_PG=${EW_GE_PG:-0.01} # drop prob in Good state
 GE_PB=${EW_GE_PB:-0.70} # drop prob in Bad state
-export PACKET_LOSS_PROB_PARAM PACKET_LOSS_PROB_GRAD DROP_MODEL DROP_SEED GE_P GE_R GE_PG GE_PB
+DROP_LOG_INTERVAL=${EW_DROP_LOG_INTERVAL:-0} # log staleness/drift metrics every N iterations (0 = off)
+export PACKET_LOSS_PROB_PARAM PACKET_LOSS_PROB_GRAD DROP_MODEL DROP_SEED GE_P GE_R GE_PG GE_PB DROP_LOG_INTERVAL
 # Distributed training variables
 LAUNCHER_TYPE=${HL_LAUNCHER_TYPE:-mpirun}
 DATA_DIR=${HL_DATA_DIR_ROOT:-/data/datasets/red_pajama}
@@ -248,6 +249,12 @@ else
     exit 1
 fi
 
+# EW: optional overrides of the learning-rate schedule set above, and the seed
+LR=${HL_LR:-${LR}}
+MIN_LR=${HL_MIN_LR:-${MIN_LR}}
+LR_WARMUP_ITERS=${HL_LR_WARMUP_ITERS:-${LR_WARMUP_ITERS}}
+SEED=${HL_SEED:-1234}
+
 if [[ $(( NUM_LAYERS % PP )) -ne 0 ]]; then
     echo 'HL_NUM_LAYERS must be divisible by PP'
     exit 1
@@ -289,6 +296,8 @@ fi
 mkdir -p "${OUTPUT_DIR}"
 mkdir -p "${CHECKPOINTS_DIR}"
 mkdir -p "${TENSORBOARD_DIR}"
+DROP_LOG_FILE=${EW_DROP_LOG_FILE:-${OUTPUT_DIR}/drop_metrics.jsonl}
+export DROP_LOG_FILE
 
 if [[ "${NUM_NODES}" -ne "1" ]] && [[ -z "${HOSTSFILE}" ]]; then
     HOSTSFILE=${MEGATRON_LM_ROOT}/examples/hostsfile
@@ -338,6 +347,7 @@ if [[ "${LAUNCHER_TYPE}" = "mpirun" ]]; then
     CMD="${CMD} -x PACKET_LOSS_PROB_GRAD=${PACKET_LOSS_PROB_GRAD}"
     CMD="${CMD} -x DROP_SEED=${DROP_SEED}"
     CMD="${CMD} -x GE_P=${GE_P} -x GE_R=${GE_R} -x GE_PG=${GE_PG} -x GE_PB=${GE_PB}"
+    CMD="${CMD} -x DROP_LOG_INTERVAL=${DROP_LOG_INTERVAL} -x DROP_LOG_FILE=${DROP_LOG_FILE}"
     CMD="${CMD} -x PT_TE_ENFORCE_BF16_AMAX_REDUCTION=${PT_TE_ENFORCE_BF16_AMAX_REDUCTION}"
     CMD="${CMD} -x PT_TE_LIMIT_GRAPH_SIZE=${PT_TE_LIMIT_GRAPH_SIZE}"
     CMD="${CMD} -x PT_HPU_LAZY_MODE=${USE_LAZY_MODE}"
@@ -414,6 +424,7 @@ CMD="${CMD} \
     --lr-decay-style cosine \
     --lr-warmup-iters ${LR_WARMUP_ITERS} \
     --min-lr ${MIN_LR} \
+    --seed ${SEED} \
     --use-torch-compile=${USE_TORCH_COMPILE} \
     --use-torch-compiled-autograd=${USE_TORCH_COMPILED_AUTOGRAD} \
     --cache-size-limit=${CACHE_SIZE_LIMIT} \

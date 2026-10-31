@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 
 import torch
 
+import json
 import os
 import random
 import torch.distributed as dist
@@ -78,6 +79,96 @@ class GilbertElliott:
     def should_drop(self) -> bool:
         # sample drop in current state
         return _drop_rng().random() < (self.pg if self.state == 'G' else self.pb)
+
+
+# ─── 2. Optional logging of the quantities predicted by the analysis ────────────
+# Enabled with DROP_LOG_INTERVAL > 0 (parameter syncs, i.e. iterations, per log line).
+# Each rank accumulates the sums below; every DROP_LOG_INTERVAL syncs they are
+# all-reduced over the data-parallel group, the mean pairwise drift between
+# non-owner copies is measured, and global rank 0 appends one JSON line to
+# DROP_LOG_FILE. All quantities are per shard (one rank's slice of a bucket):
+#   mean_age, stale_err: staleness age and ||copy - owner's shard||^2 of every
+#                        non-owned copy after the broadcast (zero if received);
+#   update_sq:           ||Delta theta||^2 of the rank's own shard (estimates sigma_j^2);
+#   mean_S, mean_inv_S:  gradient pieces that arrived for the rank's own shard;
+#   pair_drift:          mean ||copy_i - copy_k||^2 over pairs of non-owners.
+DROP_LOG_INTERVAL = int(os.getenv("DROP_LOG_INTERVAL", "0"))
+DROP_LOG_FILE = os.getenv("DROP_LOG_FILE", "drop_metrics.jsonl")
+
+
+class _PacketLossLog:
+    HOST = ("age_sum", "copies", "updates", "S_sum", "inv_S_sum", "S_count",
+            "grad_lost", "grad_links", "param_lost", "param_links", "pair_shards")
+    DEVICE = ("stale_err_sum", "update_sq_sum", "pair_drift_sum")
+
+    def __init__(self, group, world_size: int, device):
+        self.group, self.world_size = group, world_size
+        self.host = dict.fromkeys(self.HOST, 0.0)
+        # Tensor quantities stay on the device to avoid a host sync per shard.
+        self.dev = torch.zeros(len(self.DEVICE), dtype=torch.float32, device=device)
+        self.param_syncs = 0
+
+    def add_host(self, field: str, value: float) -> None:
+        self.host[field] += value
+
+    def add_dev(self, field: str, value: torch.Tensor) -> None:
+        self.dev[self.DEVICE.index(field)] += value
+
+    def flush_due(self) -> bool:
+        return self.param_syncs % DROP_LOG_INTERVAL == 0
+
+    def pair_drift(self, errors: torch.Tensor) -> None:
+        """Add the mean pairwise drift of non-owner copies; errors = copy - fresh shard.
+
+        sum_{i<k} ||e_i - e_k||^2 = m * sum_i ||e_i||^2 - ||sum_i e_i||^2 over the m
+        non-owners of a shard; the owner contributes e = 0 to both sums.
+        """
+        n = self.world_size
+        m = n - 1
+        if m < 2:
+            return
+        shards = errors.view(n, -1)
+        own_sq = shards.pow(2).sum(dim=1)
+        torch.distributed.all_reduce(errors, group=self.group)
+        torch.distributed.all_reduce(own_sq, group=self.group)
+        sum_sq = shards.pow(2).sum(dim=1)
+        self.add_dev("pair_drift_sum", ((m * own_sq - sum_sq) / (m * (m - 1) / 2)).sum())
+        self.add_host("pair_shards", n)
+
+    def flush(self) -> None:
+        names = self.HOST + self.DEVICE
+        vec = torch.cat([torch.tensor([self.host[k] for k in self.HOST], dtype=torch.float32,
+                                      device=self.dev.device), self.dev])
+        torch.distributed.all_reduce(vec, group=self.group)
+        s = dict(zip(names, vec.tolist()))
+        self.host = dict.fromkeys(self.HOST, 0.0)
+        self.dev.zero_()
+        if torch.distributed.get_rank() != 0:
+            return
+
+        def ratio(a, b):
+            return s[a] / s[b] if s[b] else None
+
+        try:
+            from megatron.training.global_vars import get_args
+            iteration = getattr(get_args(), "curr_iteration", None)
+        except Exception:
+            iteration = None
+        record = {
+            "iteration": iteration, "param_syncs": self.param_syncs,
+            "interval": DROP_LOG_INTERVAL, "N": self.world_size,
+            "param_loss_rate": ratio("param_lost", "param_links"),
+            "grad_loss_rate": ratio("grad_lost", "grad_links"),
+            "mean_age": ratio("age_sum", "copies"),
+            "stale_err": ratio("stale_err_sum", "copies"),
+            "update_sq": ratio("update_sq_sum", "updates"),
+            "pair_drift": ratio("pair_drift_sum", "pair_shards"),
+            "mean_S": ratio("S_sum", "S_count"),
+            "mean_inv_S": ratio("inv_S_sum", "S_count"),
+        }
+        with open(DROP_LOG_FILE, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
 
 class BufferType(Enum):
     """
@@ -292,7 +383,7 @@ class _ParamAndGradBucketGroup:
 
         drop_prob = float(os.getenv("PACKET_LOSS_PROB_PARAM", "0.0"))
         #drop_prob = 0.3
-        if drop_prob == 0.0 and not USE_GE:
+        if drop_prob == 0.0 and not USE_GE and not DROP_LOG_INTERVAL:
             return
         # The restore below must run after the all-gather has completed.
         assert not async_op, (
@@ -306,11 +397,20 @@ class _ParamAndGradBucketGroup:
         rng = _drop_rng()
         if USE_GE:
             self._param_loss_model.step()  # once per iteration (receiver's chain)
+        log = self._packet_loss_log()
+        if log is not None:
+            log.param_syncs += 1
         for bucket in self.buckets:
             shard_size = bucket.param_data.numel() // world_size
             assert bucket.param_data.numel() % world_size == 0, "Param buffer must align with world size."
-            if not hasattr(bucket, '_packet_loss_prev_param_data'):
+            # The first sync only creates the backup, so a "drop" there is a no-op; skip logging it.
+            first_sync = not hasattr(bucket, '_packet_loss_prev_param_data')
+            if first_sync:
                 bucket._packet_loss_prev_param_data = bucket.param_data.clone().detach()
+                bucket._packet_loss_age = [0] * world_size
+            logging_now = log is not None and not first_sync
+            pair_step = logging_now and log.flush_due()
+            fresh = bucket.param_data.clone() if pair_step else None
             for rank in range(world_size):
                 start, end = rank * shard_size, (rank + 1) * shard_size
                 # if rank == local_rank or random.random() >= drop_prob:
@@ -324,6 +424,24 @@ class _ParamAndGradBucketGroup:
                     # uniform IID
                     keep = (rng.random() >= drop_prob)
 
+                if rank != local_rank:
+                    bucket._packet_loss_age[rank] = 0 if keep or first_sync else bucket._packet_loss_age[rank] + 1
+                if logging_now:
+                    # Measured before the restore: param_data holds the fresh shard, the
+                    # backup holds this rank's previous copy (the one kept on a drop).
+                    gap = (bucket.param_data[start:end].float()
+                           - bucket._packet_loss_prev_param_data[start:end].float())
+                    if rank == local_rank:
+                        log.add_dev("update_sq_sum", gap.pow(2).sum())
+                        log.add_host("updates", 1)
+                    else:
+                        log.add_host("param_links", 1)
+                        log.add_host("copies", 1)
+                        log.add_host("age_sum", bucket._packet_loss_age[rank])
+                        if not keep:
+                            log.add_host("param_lost", 1)
+                            log.add_dev("stale_err_sum", gap.pow(2).sum())
+
                 if keep:
                     # Update backup with freshly synchronized data if NOT dropped or local shard
                     bucket._packet_loss_prev_param_data[start:end].copy_(bucket.param_data[start:end])
@@ -333,6 +451,21 @@ class _ParamAndGradBucketGroup:
                     bucket.param_data[start:end].copy_(bucket._packet_loss_prev_param_data[start:end])
                     # print(f"[ParamDropSim][Rank {global_rank}] Dropped param shard from rank {rank} in bucket {bucket.bucket_id}")
                     # print(f"[ParamDropSim][Rank {global_rank}] AFTER DROP bucket {bucket.bucket_id} from rank {rank}: {bucket.param_data[start:end]}")
+            if pair_step:
+                log.pair_drift(bucket.param_data.float() - fresh.float())
+        if log is not None and log.flush_due():
+            log.flush()
+
+    def _packet_loss_log(self) -> Optional["_PacketLossLog"]:
+        """Logging state of this bucket group; None unless DROP_LOG_INTERVAL > 0."""
+        if not DROP_LOG_INTERVAL or not self.ddp_config.use_distributed_optimizer:
+            return None
+        if getattr(self, "_drop_log", None) is None:
+            group = self.intra_distributed_optimizer_instance_group
+            self._drop_log = _PacketLossLog(
+                group, torch.distributed.get_world_size(group), self.buckets[0].grad_data.device
+            )
+        return self._drop_log
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """
@@ -452,6 +585,7 @@ class _ParamAndGradBucketGroup:
             world_size = torch.distributed.get_world_size(group)
             local_rank = self.intra_distributed_optimizer_instance_rank
             rng = _drop_rng()
+            log = self._packet_loss_log()
             if USE_GE:
                 self._grad_loss_model.step()  # once per iteration (sender's chain)
             for bucket in self.buckets:
@@ -469,6 +603,9 @@ class _ParamAndGradBucketGroup:
                     if not keep:
                         bucket.grad_data[r * shard_size : (r + 1) * shard_size].zero_()
                         bucket._packet_loss_grad_mask[r] = 0.0
+                    if log is not None:
+                        log.add_host("grad_links", 1)
+                        log.add_host("grad_lost", 0 if keep else 1)
 
         # Coalesce communication kernels across buckets in the bucket group.
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
@@ -557,6 +694,18 @@ class _ParamAndGradBucketGroup:
                     # Convert /N average to /S_j average (\hat g in Sec. 3, step (2)).
                     bucket.grad_data[start:end].mul_(world_size / s_local)
                     bucket._packet_loss_prev_grad_data[start:end].copy_(bucket.grad_data[start:end])
+                if log is not None and s_local > 0:
+                    log.add_host("S_sum", s_local)
+                    log.add_host("inv_S_sum", 1.0 / s_local)
+                    log.add_host("S_count", 1)
+        elif self._packet_loss_log() is not None:
+            # Without gradient loss every piece arrives: S_j = N.
+            log = self._packet_loss_log()
+            n = log.world_size
+            for _ in self.buckets:
+                log.add_host("S_sum", n)
+                log.add_host("inv_S_sum", 1.0 / n)
+                log.add_host("S_count", 1)
 
     def finish_grad_sync(self):
         """
